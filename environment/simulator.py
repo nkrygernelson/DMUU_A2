@@ -2,7 +2,7 @@
 ### Takes any decision-making policy as input and evaluates its average
 ### performance over E independent experiments (days).
 
-from helper.v2_SystemCharacteristics import SystemCharacteristics
+from helper.SystemCharacteristics import SystemCharacteristics
 import numpy as np
 
 

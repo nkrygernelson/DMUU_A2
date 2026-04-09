@@ -58,24 +58,24 @@ for i in range(num_paths):
 
     all_paths.append(traj)
 
+if __name__ == "__main__":
+    # -----------------------------
+    # Plot
+    # -----------------------------
+    plt.figure(figsize=(10, 5))
 
-# -----------------------------
-# Plot
-# -----------------------------
-plt.figure(figsize=(10, 5))
+    for i, traj in enumerate(all_paths):
+        plt.plot(range(T), traj, alpha=0.8, label=f"Path {i+1}")
 
-for i, traj in enumerate(all_paths):
-    plt.plot(range(T), traj, alpha=0.8, label=f"Path {i+1}")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.title("Sample Electricity Price Trajectories")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    #plt.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
 
-plt.xlabel("Time")
-plt.ylabel("Price")
-plt.title("Sample Electricity Price Trajectories")
-plt.grid(True, linestyle="--", alpha=0.4)
-#plt.legend(loc="upper right", fontsize=8)
-plt.tight_layout()
-plt.show()
+    import pandas as pd
 
-import pandas as pd
-
-#pd.DataFrame(all_paths).to_csv("OutOfSamplePriceData.csv", index=False)
+    #pd.DataFrame(all_paths).to_csv("OutOfSamplePriceData.csv", index=False)
 
