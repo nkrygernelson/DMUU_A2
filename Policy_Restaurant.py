@@ -32,7 +32,22 @@ def select_action(state):
     "HeatPowerRoom2" : 0, #replace 0 with your choice
     "VentilationON" : 0 #binary. replace 0 with 1 if your choice is ON
     }
+    HereAndNowActions = sp_policy.select_action(state)
     
     return HereAndNowActions
 
-#print(select_action(1))
+
+state = {
+    "T1": 10, #Temperature of room 1
+     "T2": 23, #Temperature of room 2
+     "H": 60, #Humidity
+     "Occ1":2, #Occupancy of room 1
+     "Occ2": 2, #Occupancy of room 2
+     "price_t": 35, #Price
+     "price_previous": 34, #Previous Price
+     "vent_counter": 2, #For how many consecutive hours has the ventilation been on 
+     "low_override_r1": True, #Is the low-temperature overrule controller of room 1 active 
+     "low_override_r2": False, #Is the low-temperature overrule controller of room 2 active 
+     "current_time":2 #What is the hour of the day
+}
+print(select_action(state))
