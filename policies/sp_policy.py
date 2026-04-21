@@ -252,7 +252,7 @@ def build_and_solve_linear_program(state, root, all_nodes, leaves ):
             #temp1
             #should check that the sign are correct and that we aren't porting over the error from last time
             parent_time = current_time + parent.stage
-            T_out_val = T_out[min(parent_time, len(T_out) - 1)]
+            T_out_val = T_out[parent_time]
 
             m.cons.add(
                 m.temp1[nid] ==
@@ -320,12 +320,13 @@ def build_and_solve_linear_program(state, root, all_nodes, leaves ):
     return m, result
 
 def select_action(state):
-    NUM_SLOTS  = 13
     current_time = state["current_time"]
-    remaining = NUM_SLOTS - current_time  # hours left
+    horizon = len(get_fixed_data()["outdoor_temperature"])
+    remaining = horizon - current_time  # hours left
 
-    # Tree sizing
-    num_stages = min(3, remaining)
+    # Tree sizing: parent.stage can reach num_stages - 1, so
+    # parent_time = current_time + (num_stages - 1) must be < horizon.
+    num_stages = max(1, min(3, remaining))
     bf = 3
 
     root, all_nodes, leaves = build_scenario_tree(bf, num_stages)
