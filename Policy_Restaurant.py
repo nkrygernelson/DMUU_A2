@@ -5,6 +5,7 @@ Created on Mon Nov 17 11:14:31 2025
 @author: geots
 """
 from policies import sp_policy
+from policies import adp_policy
 # The state will be provided by the environment as the following dictionary
 
 # state = {
@@ -33,7 +34,7 @@ def select_action(state):
     "VentilationON" : 0 #binary. replace 0 with 1 if your choice is ON
     }
     HereAndNowActions = sp_policy.select_action(state)
-    
+    #HereAndNowActions = adp_policy.select_action(state)    
     return HereAndNowActions
 
 
