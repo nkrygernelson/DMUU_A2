@@ -11,6 +11,7 @@ Feature vector phi(x) (length 11):
 import os
 import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.linear_model import Ridge
 import pyomo.environ as pyo
 
 from processes.PriceProcessRestaurant import price_model
@@ -66,7 +67,7 @@ def gen_scenarios(state, K, num_samples=150):
     return km.cluster_centers_, probs
 
 
-def solve_bellman(state, eta_next, K=5, time_limit=5.0, mip_gap=0.05):
+def solve_bellman(state, eta_next, K=10, time_limit=5.0, mip_gap=0.05):
     """Solve the one-step Bellman problem: min cost_t + E[eta_next^T phi(x_{t+1})].
 
     Returns (decision_dict, V_star).
@@ -198,27 +199,71 @@ def solve_bellman(state, eta_next, K=5, time_limit=5.0, mip_gap=0.05):
     else:
         vc_next_expr = (vc_r + 1) * m.V
 
-    # Continuation term: sum_k p_k * eta_next^T phi(x_{k,t+1})
+    # Continuation term: piecewise linear in (z1c[k], z2c[k]).
+    # eta_next is shape (4, FEATURE_DIM), indexed by region = 2*z1c + z2c.
+    # For each scenario we introduce region-indicator binaries delta_{k,r} and a
+    # single per-scenario continuation var c_k = sum_r delta_{k,r} * f_{k,r}.
+    # We further clip the per-scenario continuation at 0 since cost-to-go is
+    # non-negative — without this clip the linear approximator extrapolates to
+    # large negative values outside the training distribution and the solver
+    # exploits it, driving V* targets negative and breaking convergence.
     continuation = 0.0
-    if eta_next is not None and np.any(eta_next != 0):
+    if eta_next is not None and np.any(np.asarray(eta_next) != 0):
+        eta_next = np.asarray(eta_next, dtype=float)
+        assert eta_next.shape == (4, FEATURE_DIM), \
+            f"expected eta_next shape (4, {FEATURE_DIM}), got {eta_next.shape}"
+
+        REGIONS = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        M_big = 1.0e5  # big-M for product linearization
+
+        m.R = pyo.RangeSet(0, 3)
+        m.delta = pyo.Var(m.K, m.R, within=pyo.Binary)
+        m.c = pyo.Var(m.K, m.R)  # c_{k,r} = delta_{k,r} * f_{k,r}
+        m.V_next = pyo.Var(m.K, within=pyo.NonNegativeReals)  # max(0, sum_r c_{k,r})
+
         for k in m.K:
             Occ1_k = float(centers[k, 0])
             Occ2_k = float(centers[k, 1])
             price_k = float(centers[k, 2])
-            feat_expr = (
-                eta_next[0] * 1.0
-                + eta_next[1] * m.T1c[k]
-                + eta_next[2] * m.T2c[k]
-                + eta_next[3] * m.Hc[k]
-                + eta_next[4] * Occ1_k
-                + eta_next[5] * Occ2_k
-                + eta_next[6] * price_k
-                + eta_next[7] * price_r
-                + eta_next[8] * vc_next_expr
-                + eta_next[9] * m.z1c[k]
-                + eta_next[10] * m.z2c[k]
-            )
-            continuation = continuation + float(probs[k]) * feat_expr
+
+            # Region-indicator logic: delta_{k,r} = 1 iff (z1c[k], z2c[k]) == r.
+            # Use standard AND-of-binaries-or-their-complements linearization.
+            for r_idx, (a, b) in enumerate(REGIONS):
+                z1_lit = m.z1c[k] if a == 1 else (1 - m.z1c[k])
+                z2_lit = m.z2c[k] if b == 1 else (1 - m.z2c[k])
+                m.cons.add(m.delta[k, r_idx] <= z1_lit)
+                m.cons.add(m.delta[k, r_idx] <= z2_lit)
+                m.cons.add(m.delta[k, r_idx] >= z1_lit + z2_lit - 1)
+            m.cons.add(sum(m.delta[k, r_idx] for r_idx in range(4)) == 1)
+
+            # Per-region affine value f_{k,r} = eta_r^T phi(x_{k,t+1}).
+            for r_idx, (a, b) in enumerate(REGIONS):
+                er = eta_next[r_idx]
+                f_kr = (
+                    er[0] * 1.0
+                    + er[1] * m.T1c[k]
+                    + er[2] * m.T2c[k]
+                    + er[3] * m.Hc[k]
+                    + er[4] * Occ1_k
+                    + er[5] * Occ2_k
+                    + er[6] * price_k
+                    + er[7] * price_r
+                    + er[8] * vc_next_expr
+                    + er[9] * a  # z1c fixed inside this region
+                    + er[10] * b
+                )
+                # c_{k,r} = delta * f_kr via big-M product linearization.
+                d = m.delta[k, r_idx]
+                m.cons.add(m.c[k, r_idx] <= M_big * d)
+                m.cons.add(m.c[k, r_idx] >= -M_big * d)
+                m.cons.add(m.c[k, r_idx] <= f_kr + M_big * (1 - d))
+                m.cons.add(m.c[k, r_idx] >= f_kr - M_big * (1 - d))
+
+            # V_next[k] = max(0, sum_r c[k,r]); we minimize, so the lower bounds
+            # implied by V_next >= 0 (declared on the var) and V_next >= sum c
+            # are active and tight.
+            m.cons.add(m.V_next[k] >= sum(m.c[k, r_idx] for r_idx in range(4)))
+            continuation = continuation + float(probs[k]) * m.V_next[k]
 
     m.objective = pyo.Objective(expr=root_cost + continuation, sense=pyo.minimize)
 
@@ -334,15 +379,27 @@ def sample_exogenous(state):
     return {"Occ1": r1_next, "Occ2": r2_next, "price": price_next}
 
 
-def forward_pass(etas, N=30, K=5, T=NUM_SLOTS):
+def _region_idx(state):
+    """Map state's (low_override_r1, low_override_r2) to region index 0..3."""
+    a = int(bool(state["low_override_r1"]))
+    b = int(bool(state["low_override_r2"]))
+    return 2 * a + b
+
+
+def _zero_etas(T):
+    """Shape (T+1, 4, FEATURE_DIM) — one eta per stage per region."""
+    return np.zeros((T + 1, 4, FEATURE_DIM))
+
+
+def forward_pass(etas, N=30, K=10, T=NUM_SLOTS, time_limit=10.0, mip_gap=0.01):
     """Roll out N trajectories using the current etas. Returns list of trajectories."""
     trajectories = []
     for n in range(N):
         state = sample_init_state()
         traj = [state]
         for t in range(T):
-            eta_next = etas[t + 1] if (t + 1) < len(etas) else np.zeros(FEATURE_DIM)
-            u, _ = solve_bellman(state, eta_next, K=K)
+            eta_next = etas[t + 1] if (t + 1) < len(etas) else np.zeros((4, FEATURE_DIM))
+            u, _ = solve_bellman(state, eta_next, K=K, time_limit=time_limit, mip_gap=mip_gap)
             exog = sample_exogenous(state)
             state = advance_state(state, u, exog)
             traj.append(state)
@@ -351,37 +408,86 @@ def forward_pass(etas, N=30, K=5, T=NUM_SLOTS):
     return trajectories
 
 
-def backward_pass(trajectories, etas, K=5, T=NUM_SLOTS):
-    """Refit etas[t] via least squares on targets V*(x_{n,t}) using updated etas[t+1]."""
-    new_etas = [np.asarray(e, dtype=float).copy() for e in etas]
-    new_etas[T] = np.zeros(FEATURE_DIM)
+def backward_pass(trajectories, etas, K=10, T=NUM_SLOTS, ridge_alpha=1.0,
+                  time_limit=10.0, mip_gap=0.01):
+    """Refit etas[t, r] via Ridge on targets V*(x_{n,t}), grouped by root region r.
+
+    Returns (new_etas, diagnostics) where diagnostics is a list of dicts, one per
+    (t, r) bucket with at least one sample, containing:
+      n           sample count
+      mse         in-sample Ridge MSE  ((Xr@coef - yr)**2).mean()
+      rel_mse     mse / (mean(|yr|)**2 + eps) — scale-free fit quality
+      eta_delta   ||new_eta[t,r] - old_eta[t,r]||_2
+      y_mean,y_std,y_min,y_max  target stats
+    """
+    old_etas = np.asarray(etas, dtype=float).copy()
+    new_etas = old_etas.copy()
+    new_etas[T] = 0.0
+
+    diagnostics = []
 
     for t in range(T - 1, -1, -1):
-        X = []
-        y = []
+        # Collect (region, phi, V*) per root state at stage t.
+        buckets = {r: ([], []) for r in range(4)}
         for traj in trajectories:
             state_t = traj[t]
-            _, V_star = solve_bellman(state_t, new_etas[t + 1], K=K)
-            X.append(features(state_t))
-            y.append(V_star)
-        X = np.asarray(X)
-        y = np.asarray(y)
-        eta_t, *_ = np.linalg.lstsq(X, y, rcond=None)
-        new_etas[t] = eta_t
-        print(f"  backward t={t}: target mean={y.mean():.3f}, std={y.std():.3f}")
-    return new_etas
+            _, V_star = solve_bellman(state_t, new_etas[t + 1], K=K,
+                                      time_limit=time_limit, mip_gap=mip_gap)
+            r = _region_idx(state_t)
+            buckets[r][0].append(features(state_t))
+            buckets[r][1].append(V_star)
+
+        for r in range(4):
+            Xs, ys = buckets[r]
+            if len(ys) == 0:
+                # No samples in this region at this stage — carry over previous fit.
+                continue
+            Xr = np.asarray(Xs)
+            yr = np.asarray(ys)
+            ridge = Ridge(alpha=ridge_alpha, fit_intercept=False)
+            ridge.fit(Xr, yr)
+            new_etas[t, r] = ridge.coef_
+
+            preds = Xr @ ridge.coef_
+            mse = float(((preds - yr) ** 2).mean())
+            scale = float(np.mean(np.abs(yr))) ** 2 + 1e-9
+            eta_delta = float(np.linalg.norm(new_etas[t, r] - old_etas[t, r]))
+            diagnostics.append({
+                "t": t, "r": r, "n": int(len(yr)),
+                "mse": mse, "rel_mse": mse / scale,
+                "eta_delta": eta_delta,
+                "y_mean": float(yr.mean()), "y_std": float(yr.std()),
+                "y_min": float(yr.min()), "y_max": float(yr.max()),
+            })
+            print(
+                f"  backward t={t} r={r} n={len(yr):3d} "
+                f"y_mean={yr.mean():8.2f} y_std={yr.std():7.2f} "
+                f"mse={mse:9.3f} rel_mse={mse/scale:7.4f} "
+                f"|Δeta|={eta_delta:8.3f}"
+            )
+
+        counts = [len(buckets[r][1]) for r in range(4)]
+        print(f"  backward t={t}: region sample counts {counts}")
+    return new_etas, diagnostics
 
 
-def train(I=15, N=30, K=5, T=NUM_SLOTS, save_path=ETAS_PATH):
+def train(I=15, N=30, K=10, T=NUM_SLOTS, ridge_alpha=1.0, save_path=ETAS_PATH):
     """Run I outer iterations of forward-backward fitted value iteration."""
-    etas = [np.zeros(FEATURE_DIM) for _ in range(T + 1)]
+    etas = _zero_etas(T)
+    history = []  # one diagnostics list per iteration
     for i in range(I):
         print(f"=== Iteration {i+1}/{I} ===")
         trajectories = forward_pass(etas, N=N, K=K, T=T)
-        etas = backward_pass(trajectories, etas, K=K, T=T)
-        np.save(save_path, np.array(etas))
+        etas, diag = backward_pass(trajectories, etas, K=K, T=T, ridge_alpha=ridge_alpha)
+        history.append(diag)
+        np.save(save_path, etas)
         print(f"  saved etas to {save_path}")
-    return etas
+        # Per-iteration summary across all (t, r) buckets that had samples
+        if diag:
+            mean_rel = float(np.mean([d["rel_mse"] for d in diag]))
+            mean_delta = float(np.mean([d["eta_delta"] for d in diag]))
+            print(f"  iter summary: mean rel_mse={mean_rel:.4f}  mean |Δeta|={mean_delta:.3f}")
+    return etas, history
 
 
 _CACHED_ETAS = None
@@ -391,18 +497,22 @@ def _load_etas():
     global _CACHED_ETAS
     if _CACHED_ETAS is None:
         if os.path.exists(ETAS_PATH):
-            _CACHED_ETAS = np.load(ETAS_PATH)
+            arr = np.load(ETAS_PATH)
+            if arr.ndim == 2:  # legacy single-piece fit
+                print("Legacy etas shape detected; broadcasting to 4 regions.")
+                arr = np.broadcast_to(arr[:, None, :], (arr.shape[0], 4, arr.shape[1])).copy()
+            _CACHED_ETAS = arr
         else:
             print(f"No trained etas at {ETAS_PATH}; using zeros. Run train() first.")
-            _CACHED_ETAS = np.zeros((NUM_SLOTS + 1, FEATURE_DIM))
+            _CACHED_ETAS = _zero_etas(NUM_SLOTS)
     return _CACHED_ETAS
 
 
 def select_action(state):
     etas = _load_etas()
     t = int(state["current_time"])
-    eta_next = etas[t + 1] if (t + 1) < len(etas) else np.zeros(FEATURE_DIM)
-    decision, _ = solve_bellman(state, eta_next, K=5, time_limit=10.0, mip_gap=0.02)
+    eta_next = etas[t + 1] if (t + 1) < len(etas) else np.zeros((4, FEATURE_DIM))
+    decision, _ = solve_bellman(state, eta_next, K=10, time_limit=10.0, mip_gap=0.02)
     return decision
 
 
