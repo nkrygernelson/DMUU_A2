@@ -24,7 +24,7 @@ Action time budget per call: **15 s** (else dummy action is substituted by `chec
 - **Long pedagogical writeup**: `pdfs/deep_adp_long.md` — walks through the Bellman equation, why linear ADP fails, the MLP architecture, the grid-search vs MILP planning trade-off, the big-M ReLU encoding (with a small worked example), and the bias-variance argument for fitted-VI vs MC training. Self-contained explanation of all five attempts.
 - **Dummy** — returns zeros.
 - **Simulator (`environment/simulator.py`)** — `evaluate(policy, experiments)` runs 100 fixed days from `data/*.csv`. Returns mean cost. Internally re-applies all overrules + ventilation inertia after `policy.select_action`.
-- **Hybrid stub (`policies/hybrid_policy.py`)** — currently zeros, this is the file to fill in for Task 5.
+- **Hybrid policy (`policies/hybrid_policy.py`)** — Task 5 deliverable. SP-style MILP rollout, but with `bf=[3,3,2,2]` (4-stage tree, one deeper than SP) and a **distilled 1×8 V_θ** (`deep_adp_model_tiny.pt`, R²=1.0 vs the 1×32 teacher) at the leaves. Sparse big-M ReLU encoding skips Pyomo allocations for always-on/always-off units to fit the Gurobi size-limited license. Deterministic per-call NumPy seeding makes scenarios reproducible. 100-day mean cost **137.38** vs SP 139.74 — paired Δ = +2.35 with SE 1.34, t=1.76 (one-sided p≈0.04). Hybrid wins 57/100, ties 18, loses 25. Writeup: `pdfs/hybrid.md`.
 
 ## Key gotchas
 
