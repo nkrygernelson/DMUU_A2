@@ -357,11 +357,17 @@ def advance_state(state, decision, exog):
 
 
 def sample_init_state():
-    """Random initial state at t=0, consistent with SystemCharacteristics ranges."""
+    """Random initial state at t=0, widened to span SP's full operating range.
+
+    The simulator resets every day to T1=T2=20, H=50, vc=lo1=lo2=0; we
+    deliberately widen this here so the ridge regression at t=0 sees input
+    variance (otherwise it collapses to slope ≈ 0 — see
+    pdfs/ridge_diagnostic_log.md, Experiment A).
+    """
     return {
-        "T1": float(np.random.uniform(19, 23)),
-        "T2": float(np.random.uniform(19, 23)),
-        "H": float(np.random.uniform(40, 60)),
+        "T1": float(np.random.uniform(12, 24)),
+        "T2": float(np.random.uniform(12, 24)),
+        "H": float(np.random.uniform(40, 90)),
         "Occ1": float(np.random.uniform(25, 35)),
         "Occ2": float(np.random.uniform(15, 25)),
         "price_t": float(np.random.uniform(2, 8)),

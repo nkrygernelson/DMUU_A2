@@ -1,122 +1,61 @@
-"""Task 5 Hybrid Policy: SP scenario tree front-end + deterministic MPC tail.
+"""SP + ridge V_theta at the leaves (honorable-mention hybrid from the report).
 
-Deployed hybrid policy. At each leaf of an SP scenario tree we extend the
-MILP with a chain of deterministic decision stages out to t=T-1, where
-exogenous values come from chained Monte-Carlo mean forecasts of the price
-and occupancy processes. No learned value function — the entire horizon is
-planned inside one MILP; uncertainty is represented in the front-end where
-it matters most.
+Single linear value function per stage at each leaf: V(x_leaf) = eta_t · phi(x_leaf),
+with eta_t fitted by RidgeCV on SP-distilled Monte-Carlo returns-to-go (see
+experiments/train_single_eta_sp.py). Pure linear in the MILP — zero extra
+binaries beyond what SP already has.
 
-For bf=2, ns=2, T=10:
-  - SP nodes: 1 root + 2 + 4 = 7
-  - Deterministic tail: 4 leaves * 7 stages = 28
-  - Total: 35 nodes, ~245 binaries
+Feature vector phi(x) (length 11):
+  [1, T1, T2, H, Occ1, Occ2, price_t, price_previous,
+   vent_counter, low_override_r1, low_override_r2]
 
-Per-leaf forecast: roll the AR price/occupancy models forward, taking the
-conditional expectation at each step (estimated by Monte-Carlo averaging
-M=50 one-step samples and chaining the mean forward). Each scenario branch
-has its own tail seeded from its own leaf state.
+eta[t, 0] holds the fitted intercept (phi[0] is hardcoded to 1.0).
 
-100-day mean cost: 146.69 (vs plain SP 139.74). See pdfs/hybrid_sp.md.
+Approximation: vent_counter at each leaf is treated as the root state's
+vc_root (cheap proxy for a feature that's small in magnitude relative to
+the others, see pdfs/hybrid_sp.md).
+
+100-day mean cost: 153.21 (vs plain SP 139.74 and the deployed SP+MPC
+hybrid_policy at 146.69). Kept for reproducibility of the figure
+'sp_distilled_per_stage_scatter.png' and the 153.21 number in the report.
 """
 
+import os
 import numpy as np
 import pyomo.environ as pyo
 
 from SystemCharacteristics import get_fixed_data
-from processes.PriceProcessRestaurant import price_model
-from processes.OccupancyProcessRestaurant import next_occupancy_levels
 from policies.sp_policy import (
-    ScenarioNode,
     build_scenario_tree,
     propagate_uncertainty,
 )
 
+FEATURE_DIM = 11
+SINGLE_ETAS_PATH = os.path.join(os.path.dirname(__file__), "adp_etas_single_sp.npy")
 NUM_SLOTS = int(get_fixed_data()["num_timeslots"])
-BF = 2
+
+BF = 3
 NUM_STAGES = 2
-TAIL_FORECAST_SAMPLES = 50
+
+_CACHED_ETAS = None
 
 
-def _mean_forecast_from(leaf_state, n_steps, n_samples=TAIL_FORECAST_SAMPLES):
-    """Roll AR1 price + occupancy forward n_steps starting from leaf state.
-
-    Returns list of dicts {price, Occ1, Occ2} for stages leaf+1, leaf+2, ...
-    Each step uses the Monte Carlo average of n_samples one-step draws as
-    the expected value.
-    """
-    cur_price = float(leaf_state["current_price"])
-    prev_price = float(leaf_state["prev_price"])
-    Occ1 = float(leaf_state["current_r1_occ"])
-    Occ2 = float(leaf_state["current_r2_occ"])
-
-    out = []
-    for _ in range(n_steps):
-        prices = np.array([price_model(cur_price, prev_price)
-                           for _ in range(n_samples)])
-        occs = np.array([next_occupancy_levels(Occ1, Occ2)
-                         for _ in range(n_samples)])
-        mean_price = float(prices.mean())
-        mean_o1 = float(occs[:, 0].mean())
-        mean_o2 = float(occs[:, 1].mean())
-        out.append({"price": mean_price, "Occ1": mean_o1, "Occ2": mean_o2})
-
-        prev_price = cur_price
-        cur_price = mean_price
-        Occ1 = mean_o1
-        Occ2 = mean_o2
-    return out
-
-
-def _extend_with_deterministic_tail(all_nodes, leaves, current_time):
-    """Append a deterministic decision chain to each leaf out to stage `remaining`.
-
-    Tail length per leaf is `remaining - num_stages`, where remaining is the
-    hours left in the horizon. The chain's last node is the terminal (no
-    decisions there). `prob` is 1.0 along the chain (so path_prob through the
-    tail equals the leaf's scenario probability).
-    Returns the updated (all_nodes, tail_nodes_per_leaf, terminal_nodes).
-    """
-    remaining = NUM_SLOTS - current_time
-    counter = max(n.node_id for n in all_nodes) + 1
-    tail_per_leaf = {}
-    terminal_nodes = []  # the very last stage nodes (no decisions there)
-
-    for leaf in leaves:
-        leaf_stage = leaf.stage
-        n_tail_stages = remaining - leaf_stage  # tail extends to stage = remaining
-        if n_tail_stages <= 0:
-            terminal_nodes.append(leaf)
-            tail_per_leaf[leaf.node_id] = []
-            continue
-
-        forecast = _mean_forecast_from(leaf.state, n_tail_stages)
-
-        chain = []
-        parent = leaf
-        for k in range(n_tail_stages):
-            node = ScenarioNode(
-                node_id=counter,
-                stage=leaf_stage + 1 + k,
-                parent=parent,
-                prob=1.0,
+def _load_etas():
+    global _CACHED_ETAS
+    if _CACHED_ETAS is None:
+        if not os.path.exists(SINGLE_ETAS_PATH):
+            raise FileNotFoundError(
+                f"No single-eta file at {SINGLE_ETAS_PATH}. Run "
+                "experiments/train_single_eta_sp.py first."
             )
-            node.state = {
-                "current_r1_occ": forecast[k]["Occ1"],
-                "current_r2_occ": forecast[k]["Occ2"],
-                "current_price":  forecast[k]["price"],
-                "prev_price":     (parent.state.get("current_price", 0.0)
-                                   if parent.state else 0.0),
-            }
-            parent.children.append(node)
-            all_nodes.append(node)
-            chain.append(node)
-            counter += 1
-            parent = node
-        terminal_nodes.append(chain[-1])
-        tail_per_leaf[leaf.node_id] = chain
-
-    return all_nodes, tail_per_leaf, terminal_nodes
+        arr = np.load(SINGLE_ETAS_PATH)
+        if arr.shape != (NUM_SLOTS + 1, FEATURE_DIM):
+            raise ValueError(
+                f"Etas shape {arr.shape} doesn't match expected "
+                f"({NUM_SLOTS + 1}, {FEATURE_DIM})."
+            )
+        _CACHED_ETAS = arr
+    return _CACHED_ETAS
 
 
 def _path_prob(node):
@@ -127,7 +66,8 @@ def _path_prob(node):
     return p
 
 
-def _build_and_solve(state, root, all_nodes, terminal_nodes):
+def _build_and_solve(state, root, all_nodes, leaves):
+    etas = _load_etas()
     current_time = state["current_time"]
 
     fixed_data = get_fixed_data()
@@ -153,7 +93,6 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
 
     m = pyo.ConcreteModel()
     nids = [n.node_id for n in all_nodes]
-    terminal_ids = set(n.node_id for n in terminal_nodes)
     m.NODES = pyo.Set(initialize=nids)
 
     m.p1 = pyo.Var(m.NODES, bounds=(0, P_overline))
@@ -195,10 +134,8 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
 
     for node in all_nodes:
         nid = node.node_id
-        is_terminal = nid in terminal_ids
 
-        if not is_terminal:
-            # Decision-bearing node: same constraints + cost as SP non-leaf node.
+        if node.children:
             m.cons.add(m.temp1[nid] - T_high <= M_high * m.z1_hot[nid])
             m.cons.add(m.p1[nid] <= P_overline * (1 - m.z1_hot[nid]))
             m.cons.add(m.temp2[nid] - T_high <= M_high * m.z2_hot[nid])
@@ -214,23 +151,12 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
             wp = _path_prob(node)
             obj_expr += wp * price * (m.p1[nid] + m.p2[nid] + p_vent * m.V[nid])
             m.cons.add(m.ON[nid] + m.OFF[nid] <= 1)
-        else:
-            # Terminal node: no decisions, but the state vars still exist so
-            # we can enforce dynamics from its parent. Pin decisions to zero
-            # to keep the search space clean.
-            m.p1[nid].fix(0)
-            m.p2[nid].fix(0)
-            m.V[nid].fix(0)
-            m.ON[nid].fix(0)
-            m.OFF[nid].fix(0)
-            m.z1_hot[nid].fix(0)
-            m.z2_hot[nid].fix(0)
 
         if node.parent is not None:
             parent = node.parent
             pid = parent.node_id
             parent_time = current_time + parent.stage
-            T_out_val = T_out[min(parent_time, len(T_out) - 1)]
+            T_out_val = T_out[parent_time]
 
             m.cons.add(
                 m.temp1[nid] == m.temp1[pid]
@@ -267,6 +193,36 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
             m.cons.add(T_ok - m.temp1[nid] <= M_high * (1 - m.z1_cold[pid] + m.z1_cold[nid]))
             m.cons.add(T_ok - m.temp2[nid] <= M_high * (1 - m.z2_cold[pid] + m.z2_cold[nid]))
 
+    # Leaf value: single linear term per leaf, no regions, no big-M.
+    vc_leaf_const = float(vc_root)
+    for leaf in leaves:
+        nid = leaf.node_id
+        t_leaf = current_time + leaf.stage
+        if t_leaf >= etas.shape[0]:
+            continue
+        eta = etas[t_leaf]  # (FEATURE_DIM,)
+
+        Occ1_leaf = float(leaf.state["current_r1_occ"])
+        Occ2_leaf = float(leaf.state["current_r2_occ"])
+        price_leaf = float(leaf.state["current_price"])
+        price_prev_leaf = float(leaf.parent.state["current_price"])
+
+        V_leaf = (
+            eta[0] * 1.0
+            + eta[1] * m.temp1[nid]
+            + eta[2] * m.temp2[nid]
+            + eta[3] * m.hum[nid]
+            + eta[4] * Occ1_leaf
+            + eta[5] * Occ2_leaf
+            + eta[6] * price_leaf
+            + eta[7] * price_prev_leaf
+            + eta[8] * vc_leaf_const
+            + eta[9] * m.z1_cold[nid]
+            + eta[10] * m.z2_cold[nid]
+        )
+        wp = _path_prob(leaf)
+        obj_expr += wp * V_leaf
+
     m.objective = pyo.Objective(expr=obj_expr, sense=pyo.minimize)
     solver = pyo.SolverFactory("gurobi")
     solver.options["TimeLimit"] = 10
@@ -281,7 +237,6 @@ def select_action(state):
     remaining = NUM_SLOTS - current_time
     num_stages = max(1, min(NUM_STAGES, remaining))
 
-    # SP front-end
     root, all_nodes, leaves = build_scenario_tree(BF, num_stages)
     root.state = {
         "current_r1_occ": state["Occ1"],
@@ -291,12 +246,7 @@ def select_action(state):
     }
     propagate_uncertainty(root, all_nodes, num_samples=150)
 
-    # Deterministic MPC tail per leaf
-    all_nodes, _, terminal_nodes = _extend_with_deterministic_tail(
-        all_nodes, leaves, current_time
-    )
-
-    m, result = _build_and_solve(state, root, all_nodes, terminal_nodes)
+    m, result = _build_and_solve(state, root, all_nodes, leaves)
 
     rid = root.node_id
     ok = (result.solver.status == pyo.SolverStatus.ok and

@@ -1,39 +1,116 @@
-# DMUU A2 — Project notes for Claude
+# DMUU A2 — Task 5 hybrid policy (final branch)
 
-Keep edits minimal, code clean and readable, comments sparse. Don't modify `Policy_Restaurant.py`, `SystemCharacteristics.py`, `helper/`, `processes/`, or `policies/sp_policy.py` (working reference).
+This branch (`task-5-final`) holds the final deliverables for Task 5 of the assignment and the exact scripts needed to reproduce every figure in `pdfs/hybrid_sp.md`. The hybrid-policy investigation and prior exploratory branches are not preserved here.
 
-## Problem in one paragraph
+Don't modify `SystemCharacteristics.py`, `helper/`, `processes/`, or `policies/sp_policy.py` — these are the assignment-provided reference. Keep edits minimal, code readable, comments sparse.
 
-10-hour HVAC control for a 2-room restaurant. Per hour pick `p1, p2 ∈ [0, 3] kW` (continuous) and `V ∈ {0,1}` (binary). Cost = `price_t · (p1 + p2 + p_vent · V)`, summed over t=0..9. Exogenous stochastic: electricity price (mean-reverting AR, given by `price_model`) and per-room occupancy (Markovian AR, `next_occupancy_levels`). Endogenous state evolves linearly in T1, T2, H from the chosen actions and exogenous occupancy. Three overrules are *enforced by the simulator after* the policy returns: high-temp (heater forced off above 26°C), low-temp (heater forced to max once T<18, until T≥22), humidity (V forced on above 70%), plus **ventilation inertia**: once V=1 it must stay on ≥3 hours.
+## Problem (one paragraph)
 
-Action time budget per call: **15 s** (else dummy action is substituted by `check_and_sanitize_action`).
+10-hour HVAC control for a 2-room restaurant. Per hour pick `p1, p2 ∈ [0, 3] kW` (continuous) and `V ∈ {0,1}` (binary). Cost = `price_t · (p1 + p2 + p_vent · V)`, summed over t=0..9. Exogenous stochastic: electricity price (mean-reverting AR(2) in `processes/PriceProcessRestaurant.py`) and per-room occupancy (Markovian AR in `processes/OccupancyProcessRestaurant.py`). Endogenous state evolves linearly in T1, T2, H from the chosen actions and exogenous occupancy. Three overrules are enforced by the simulator: high-temp (heater forced off above 26°C), low-temp (heater forced to max once T<18, until T≥22), humidity (V forced on above 70%), plus ventilation inertia (once V=1 it stays on ≥3 hours). Action time budget per call: **15 s** (else dummy action is substituted by `check_and_sanitize_action`).
 
 ## State the policy receives
 
-`{T1, T2, H, Occ1, Occ2, price_t, price_previous, vent_counter, low_override_r1, low_override_r2, current_time}`. `current_time ∈ [0,9]`. Initial state and all coefficients are in `SystemCharacteristics.get_fixed_data()`.
+`{T1, T2, H, Occ1, Occ2, price_t, price_previous, vent_counter, low_override_r1, low_override_r2, current_time}`. `current_time ∈ [0, 9]`. Initial state from `SystemCharacteristics.get_fixed_data()`: `T1 = T2 = 21.0`, `H = 40.0`, `vc = lo1 = lo2 = 0`.
 
-## What's already built
+## Policies (under `policies/`)
 
-- **SP (`policies/sp_policy.py`)** — multi-stage scenario tree, KMeans-clustered child scenarios, MILP solved with Pyomo+Gurobi. At each step: `num_stages = min(3, remaining)`, `bf=3`. Solver capped at 10 s with `MIPGap=0.02`. Reference implementation for dynamics + overrule encoding.
-- **ADP (`policies/adp_policy.py`)** — linear VFA over an 11-dim feature vector `[1, T1, T2, H, Occ1, Occ2, price_t, price_prev, vent_counter, lo1, lo2]`. Trained by forward-backward fitted value iteration; one eta vector per stage, saved to `policies/adp_etas.npy`. At test time: one-step Bellman MILP with `K=5` KMeans-clustered child scenarios and learned `eta_next^T φ(x')` as continuation.
-- **Deep ADP (`policies/deep_adp_policy.py`)** — single PyTorch MLP (2×64 ReLU) over a 12-dim state (adds `t/T` and `1−t/T`) replaces the linear VFA. Forward-backward fitted VI with ε-greedy exploration. Online: constrained grid search over (p1, p2, V) with MC expectation (M=20). Trained model at `policies/deep_adp_model.pt`. On 100 days: mean cost 174.08 (vs SP 139.76, dummy 182.91) — beats dummy but ~24% short of SP.
-- **MILP rollout + V_θ at leaves (`policies/deep_adp_milp_policy.py`)** — hybrid: SP-style 2-stage MILP for tactical decisions, learned 1×32 MLP V_θ embedded at leaves via big-M ReLU. Uses a separate smaller VNet trained for MILP tractability; weights at `policies/deep_adp_model_small.pt`. On 100 days: mean cost ~143.5 vs SP ~139.7 (~3% off SP). Writeup: `pdfs/deep_adp.md`.
-- **MILP rollout v2 — on-policy MC retraining (`policies/deep_adp_milp_v2_policy.py`)** — same MILP structure; V_θ retrained via Monte Carlo returns from rollouts of the MILP policy itself (no Bellman bootstrap). Weights at `policies/deep_adp_model_small_v2.pt`. Result: ~145.6, no improvement over v1 — MC target variance dominated the distribution-shift benefit. Documented as Attempt 3 in `pdfs/deep_adp.md`.
-- **MILP rollout v3 — 3-stage tree (`policies/deep_adp_milp_v3_policy.py`)** — uses v1's fitted-VI V_θ (`deep_adp_model_small.pt`) inside a bf=2, num_stages=3 MILP (matches SP's tactical depth; bf=2 to stay under the Gurobi size-limited license). 100-day mean cost **140.31** vs SP 139.72 — paired Δ = -0.59 with SE 1.69, statistically indistinguishable. The SP-distillation V_θ experiment is preserved as `train_distill_attempt()` and `deep_adp_model_small_v3.pt`; it underperformed (R² 0.78, eval 150–161) and is not used by `select_action`. Documented as Attempt 4 in `pdfs/deep_adp.md`.
-- **SP backwards-induction policy (`policies/sp_backward_induction_policy.py`)** — same inference structure as v1 (bf=3, ns=2 MILP rollout with V_θ at leaves), but V_θ is trained as **10 independent per-time-step MLPs** via fitted backwards induction over SP rollouts (the "original SP policy"). Each V_θ_t is a small (1×16) MLP fit with sklearn L-BFGS; per-t weights saved to `policies/sp_backward_induction_models/V_t{0..9}.npz`. Training R² is excellent (0.92–0.997) but the policy gets **160.49** mean cost on 100 days — worse than SP, v1, and v3. Lesson: per-t MLPs overfit and the Bellman bootstrap chain compounds the bias. Documented as Attempt 5 in both `pdfs/deep_adp.md` and `pdfs/deep_adp_long.md`.
-- **Long pedagogical writeup**: `pdfs/deep_adp_long.md` — walks through the Bellman equation, why linear ADP fails, the MLP architecture, the grid-search vs MILP planning trade-off, the big-M ReLU encoding (with a small worked example), and the bias-variance argument for fitted-VI vs MC training. Self-contained explanation of all five attempts.
-- **Dummy** — returns zeros.
-- **Simulator (`environment/simulator.py`)** — `evaluate(policy, experiments)` runs 100 fixed days from `data/*.csv`. Returns mean cost. Internally re-applies all overrules + ventilation inertia after `policy.select_action`.
-- **Hybrid stub (`policies/hybrid_policy.py`)** — currently zeros, this is the file to fill in for Task 5.
+| File | What it is | 100-day mean cost |
+|---|---|---|
+| `sp_policy.py` | Task 3 SP. `bf=3, num_stages = min(3, remaining)`. Gurobi, TimeLimit=10s, MIPGap=0.02. | **139.74** |
+| `hybrid_policy.py` | **Task 5 deployed hybrid.** SP front-end + deterministic MPC tail. No learned V_θ. Per-leaf tail: chained Monte-Carlo mean forecasts of price/occupancy out to t=T−1. | 146.69 |
+| `sp_ridge_hybrid_policy.py` | Honorable-mention hybrid. SP + ridge V_θ at leaves, single eta per stage, SP-distilled MC return-to-go targets. Pure linear in MILP. | 153.21 |
+| `sp_cfa_policy.py` | SP + Cost Function Approximation. Threshold-form slack penalties at the leaves: cold-buffer and humid-buffer. Default `ALPHA = BETA = 0` (which reduces to plain SP — the empirically tuned optimum, see report). | 139.74 (at α=β=0) |
+| `adp_policy.py` | Per-(stage, region) ridge ADP from Task 4. Cherry-picked from `origin/adp-fix`. Provides utility functions (`features`, `advance_state`, `sample_exogenous`) imported by training scripts. | — |
+| `dummy_policy.py` | Returns zeros at every step. | 182.91 |
+
+### Data files
+
+| File | What it is |
+|---|---|
+| `policies/adp_etas.npy` | Per-(stage, region) etas for `adp_policy.py` (Task 4 deployment). Shape `(11, 4, 11)`. |
+| `policies/adp_etas_single_sp.npy` | Per-stage single-eta etas for `sp_ridge_hybrid_policy.py`. Shape `(11, 11)`. Trained via SP distillation. |
+| `policies/adp_single_sp_rollouts.npz` | Cached `(t, phi, rtg)` records from SP rollouts; used by `experiments/train_single_eta_sp.py` (re-fit without re-rolling) and `experiments/diagnose_sp_distilled.py`. |
+
+## Writeup and figures
+
+**Main writeup**: `pdfs/hybrid_sp.md` — the LaTeX-style writeup for Task 5. References six figures in `plots/`:
+
+| Figure file in `plots/` | Generated by | Section in writeup |
+|---|---|---|
+| `cfa_grid_v2_heatmap_screen.png` | `experiments/grid_search_cfa_v2.py` | SP+CFA grid search |
+| `sp_hp_sweep_cost.png` | `experiments/sp_hp_sweep.py` | SP HP tuning |
+| `sp_vs_hindsight_per_day.png` | `experiments/plot_sp_vs_hindsight.py` | When SP fails |
+| `regret_correlates.png` | `experiments/regret_correlates.py` | When SP fails |
+| `regret_vs_price_trend.png` | `experiments/plot_regret_vs_trend.py` | When SP fails |
+| `sp_distilled_per_stage_scatter.png` | `experiments/diagnose_sp_distilled.py` | SP+ADP ridge hybrid |
+
+Supporting CSV / NPZ artifacts:
+- `plots/hindsight_optimal_per_day.npz` — output of `experiments/hindsight_optimal.py`. Per-day offline-optimal costs (mean 129.02).
+- `plots/sp_gurobi_per_day.npz` — output of `experiments/run_sp_baseline.py`. Per-day SP costs (mean 139.74).
+- `plots/cfa_grid_v2_{results,final}.csv` — CFA grid raw numbers.
+- `plots/sp_hp_sweep_results.csv` — SP HP sweep raw numbers.
+
+**Diagnostic companion**: `pdfs/ridge_diagnostic_log.md` — long-form chronological notes on the ridge-V_θ investigation that led to the report's "honorable mention" section.
+
+## How to reproduce the figures
+
+From the repo root:
+
+```bash
+# Per-day baselines (needed before the regret plots)
+.venv/bin/python experiments/run_sp_baseline.py        # writes plots/sp_gurobi_per_day.npz
+.venv/bin/python experiments/hindsight_optimal.py      # writes plots/hindsight_optimal_per_day.npz
+
+# Train the ridge V_theta for the SP+ADP honorable-mention hybrid
+.venv/bin/python experiments/train_single_eta_sp.py    # writes policies/adp_etas_single_sp.npy
+
+# Generate the six report figures
+.venv/bin/python experiments/grid_search_cfa_v2.py     # plots/cfa_grid_v2_heatmap_screen.png
+.venv/bin/python experiments/sp_hp_sweep.py            # plots/sp_hp_sweep_cost.png
+.venv/bin/python experiments/plot_sp_vs_hindsight.py   # plots/sp_vs_hindsight_per_day.png
+.venv/bin/python experiments/regret_correlates.py      # plots/regret_correlates.png
+.venv/bin/python experiments/plot_regret_vs_trend.py   # plots/regret_vs_price_trend.png
+.venv/bin/python experiments/diagnose_sp_distilled.py  # plots/sp_distilled_per_stage_scatter.png
+```
+
+Each script is idempotent. `train_single_eta_sp.py` caches rollouts in `policies/adp_single_sp_rollouts.npz`; re-running picks up the cache (set `RECOLLECT=1` to force fresh rollouts). `sp_hp_sweep.py` is slow (~30 min) because of the larger SP tree configurations.
+
+## Key reference numbers (100-day mean cost, `data/v2_*.csv`)
+
+| Policy | Mean cost | Δ vs SP |
+|---|---|---|
+| Hindsight-optimal (offline lower bound) | **129.02** | −10.7 |
+| **SP-Gurobi** | **139.74** | 0 |
+| SP+CFA at α=β=0 (= plain SP, empirical optimum) | 139.74 | 0 |
+| **SP+MPC tail (`hybrid_policy.py`)** | **146.69** | +6.9 |
+| SP+ridge V_θ (`sp_ridge_hybrid_policy.py`) | 153.21 | +13.5 |
+| Dummy | 182.91 | +43.2 |
+
+Verification: hindsight MILP run on **task A's** `PriceData.csv` reproduces 111.58 (matches Task 1 reference). The 129.02 result on the v2 data is correct; the higher prices in v2 explain the higher floor.
+
+## The central analytical finding (writeup section "When does SP fail")
+
+Across 100 days, the per-day SP regret over hindsight has mean 11.1 and median 5.5 — concentrated in a tail of ~20 days. Correlating regret with 14 candidate per-day measures:
+- `price_trend` (`p_9 − p_0`): **r = +0.72** (dominant signal).
+- `ar1_surprise` (Σ squared 1-step AR(2) residuals): r = −0.02 (essentially zero).
+- `mean price`, `hindsight cost`: small negative.
+
+**Mechanism**: the price model is mean-reverting AR(2) with long-run mean 4. On rising-price days (`p_0 ≈ 3`, `p_9 ≈ 7`), SP's scenario tree at t=0 samples late prices that regress toward 4 — a late-day spike doesn't appear in any cluster center. Hindsight, knowing the spike is coming, pre-heats hard during the cheap morning. SP heats uniformly and pays for the expensive afternoon.
+
+**Why no leaf augmentation we tried helps**: the SP-trained V_θ has no trend feature in its 11-dim φ; CFA penalties are on leaf *state* not future *trajectory*; the MPC deterministic tail forecasts roll the same mean-reverting model; deeper trees still sample from the same distribution. **The bottleneck is the uncertainty model, not the policy class.**
 
 ## Key gotchas
 
-- **Actions are mixed**, not fully continuous (V is binary with a 3-step lockout). Any continuous-action method needs special handling for V.
-- **Horizon is 10**, not 13. Short horizon → SP/ADP already strong baselines.
-- **Comfort constraints are enforced post-hoc by the simulator**, so a policy can ignore them and still produce feasible runs, but it will pay through the overrule-induced cost. Any learned policy that doesn't internalize this leans on the simulator's safety net.
+- **Actions are mixed** (`V` is binary with a 3-step lockout). Any continuous-action method needs special handling for `V`.
+- **Comfort constraints are enforced post-hoc by the simulator**; the override controllers are essentially automatic recourse. Trying to anticipate them with CFA penalties usually causes over-spending on preemptive heating (see CFA grid search result).
 - `outdoor_temperature` is deterministic from the config; only price and occupancy are stochastic.
-- `vent_counter` is the inertia clock: 0 = off, 1..2 = must stay on, ≥3 = free to turn off.
+- **Hindsight MILP initial state** must be `T1=T2=21, H=40` matching `SystemCharacteristics.get_fixed_data()`. The humidity dynamics in `experiments/hindsight_optimal.py` use `>=` (not `==`) to mirror the simulator's `np.clip(H, 0, 100)`.
+- **The MPC tail's chained-mean forecast is action-independent** — it only works because the exogenous processes (price, occupancy) don't depend on actions. For an action-dependent exogenous process you'd need an ADP-style value function instead.
+- **Simulator's `something_crazy` warning** is from a self-test in `helper/v2_Checks.py` and is unrelated to the policy under test; always present in eval logs.
+- **`policies/sp_policy.py` is the working reference** — don't modify it.
 
-## Files I don't need to re-read
+## Branch history
 
-I've already read: `SystemCharacteristics.py`, `policies/sp_policy.py`, `policies/adp_policy.py`, `policies/hybrid_policy.py`, `environment/simulator.py`, `processes/PriceProcessRestaurant.py`, `processes/OccupancyProcessRestaurant.py`, `helper/v2_Checks.py`, `README.md`. For anything else, read on demand.
+- Branched from `hybrid-minimal` (the exploratory branch with the full investigation history).
+- All exploratory scripts, older policies, intermediate plots, and prior writeups have been removed.
+- This branch holds only what's needed to reproduce the figures in `pdfs/hybrid_sp.md` plus the four policy files mentioned there.

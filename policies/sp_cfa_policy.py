@@ -1,122 +1,45 @@
-"""Task 5 Hybrid Policy: SP scenario tree front-end + deterministic MPC tail.
+"""SP + Cost Function Approximation (CFA).
 
-Deployed hybrid policy. At each leaf of an SP scenario tree we extend the
-MILP with a chain of deterministic decision stages out to t=T-1, where
-exogenous values come from chained Monte-Carlo mean forecasts of the price
-and occupancy processes. No learned value function — the entire horizon is
-planned inside one MILP; uncertainty is represented in the front-end where
-it matters most.
+A hybrid of SP (Task 3) and CFA (one of the policy classes named in the
+assignment's Task 5). Structurally identical to `sp_policy` — same scenario
+tree, same constraints, same dynamics — with three additional **linear
+penalty terms at the leaves** that shape the policy toward better tail
+states without adding any tree depth or training:
 
-For bf=2, ns=2, T=10:
-  - SP nodes: 1 root + 2 + 4 = 7
-  - Deterministic tail: 4 leaves * 7 stages = 28
-  - Total: 35 nodes, ~245 binaries
+  CFA penalty per leaf =
+       ALPHA * (slack_cold_r1 + slack_cold_r2)   # max(0, T_target - T_leaf)
+     + BETA  * H_leaf                            # discourage high humidity at leaf
+     + GAMMA * (z1_cold_leaf + z2_cold_leaf)     # discourage active low-override at leaf
 
-Per-leaf forecast: roll the AR price/occupancy models forward, taking the
-conditional expectation at each step (estimated by Monte-Carlo averaging
-M=50 one-step samples and chaining the mean forward). Each scenario branch
-has its own tail seeded from its own leaf state.
+The slacks use the standard `u >= T_target - T_leaf; u >= 0` encoding (no new
+binaries, just continuous slack vars). The objective adds the path-probability
+weighted sum of these penalties over all leaves.
 
-100-day mean cost: 146.69 (vs plain SP 139.74). See pdfs/hybrid_sp.md.
+No training data, no value-function fitting. Three hand-tuned knobs.
 """
 
+from dataclasses import dataclass, field
 import numpy as np
 import pyomo.environ as pyo
 
 from SystemCharacteristics import get_fixed_data
-from processes.PriceProcessRestaurant import price_model
-from processes.OccupancyProcessRestaurant import next_occupancy_levels
 from policies.sp_policy import (
-    ScenarioNode,
     build_scenario_tree,
     propagate_uncertainty,
 )
 
 NUM_SLOTS = int(get_fixed_data()["num_timeslots"])
-BF = 2
-NUM_STAGES = 2
-TAIL_FORECAST_SAMPLES = 50
 
+# Tree config (same as sp_policy)
+BF = 3
+NUM_STAGES = 3
 
-def _mean_forecast_from(leaf_state, n_steps, n_samples=TAIL_FORECAST_SAMPLES):
-    """Roll AR1 price + occupancy forward n_steps starting from leaf state.
-
-    Returns list of dicts {price, Occ1, Occ2} for stages leaf+1, leaf+2, ...
-    Each step uses the Monte Carlo average of n_samples one-step draws as
-    the expected value.
-    """
-    cur_price = float(leaf_state["current_price"])
-    prev_price = float(leaf_state["prev_price"])
-    Occ1 = float(leaf_state["current_r1_occ"])
-    Occ2 = float(leaf_state["current_r2_occ"])
-
-    out = []
-    for _ in range(n_steps):
-        prices = np.array([price_model(cur_price, prev_price)
-                           for _ in range(n_samples)])
-        occs = np.array([next_occupancy_levels(Occ1, Occ2)
-                         for _ in range(n_samples)])
-        mean_price = float(prices.mean())
-        mean_o1 = float(occs[:, 0].mean())
-        mean_o2 = float(occs[:, 1].mean())
-        out.append({"price": mean_price, "Occ1": mean_o1, "Occ2": mean_o2})
-
-        prev_price = cur_price
-        cur_price = mean_price
-        Occ1 = mean_o1
-        Occ2 = mean_o2
-    return out
-
-
-def _extend_with_deterministic_tail(all_nodes, leaves, current_time):
-    """Append a deterministic decision chain to each leaf out to stage `remaining`.
-
-    Tail length per leaf is `remaining - num_stages`, where remaining is the
-    hours left in the horizon. The chain's last node is the terminal (no
-    decisions there). `prob` is 1.0 along the chain (so path_prob through the
-    tail equals the leaf's scenario probability).
-    Returns the updated (all_nodes, tail_nodes_per_leaf, terminal_nodes).
-    """
-    remaining = NUM_SLOTS - current_time
-    counter = max(n.node_id for n in all_nodes) + 1
-    tail_per_leaf = {}
-    terminal_nodes = []  # the very last stage nodes (no decisions there)
-
-    for leaf in leaves:
-        leaf_stage = leaf.stage
-        n_tail_stages = remaining - leaf_stage  # tail extends to stage = remaining
-        if n_tail_stages <= 0:
-            terminal_nodes.append(leaf)
-            tail_per_leaf[leaf.node_id] = []
-            continue
-
-        forecast = _mean_forecast_from(leaf.state, n_tail_stages)
-
-        chain = []
-        parent = leaf
-        for k in range(n_tail_stages):
-            node = ScenarioNode(
-                node_id=counter,
-                stage=leaf_stage + 1 + k,
-                parent=parent,
-                prob=1.0,
-            )
-            node.state = {
-                "current_r1_occ": forecast[k]["Occ1"],
-                "current_r2_occ": forecast[k]["Occ2"],
-                "current_price":  forecast[k]["price"],
-                "prev_price":     (parent.state.get("current_price", 0.0)
-                                   if parent.state else 0.0),
-            }
-            parent.children.append(node)
-            all_nodes.append(node)
-            chain.append(node)
-            counter += 1
-            parent = node
-        terminal_nodes.append(chain[-1])
-        tail_per_leaf[leaf.node_id] = chain
-
-    return all_nodes, tail_per_leaf, terminal_nodes
+# CFA coefficients (tuned by experiments/grid_search_cfa_v2.py).
+# Threshold-form penalties: only active near problematic states.
+ALPHA = 0.0       # cold-buffer penalty: weight on max(0, T_LOW_PEN - T_leaf)
+BETA = 0.0        # humid-buffer penalty: weight on max(0, H_leaf - H_HIGH_PEN)
+T_LOW_PEN = 20.0  # penalize T_leaf below this (override fires at T < 18)
+H_HIGH_PEN = 60.0 # penalize H_leaf above this (override fires at H > 70)
 
 
 def _path_prob(node):
@@ -127,7 +50,15 @@ def _path_prob(node):
     return p
 
 
-def _build_and_solve(state, root, all_nodes, terminal_nodes):
+def _build_and_solve(state, root, all_nodes, leaves,
+                     alpha=None, beta=None,
+                     t_low_pen=None, h_high_pen=None):
+    """SP MILP plus CFA leaf penalties."""
+    if alpha is None: alpha = ALPHA
+    if beta is None:  beta = BETA
+    if t_low_pen is None: t_low_pen = T_LOW_PEN
+    if h_high_pen is None: h_high_pen = H_HIGH_PEN
+
     current_time = state["current_time"]
 
     fixed_data = get_fixed_data()
@@ -145,7 +76,7 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
     T_ok = fixed_data["temp_OK_threshold"]
     T_out = fixed_data["outdoor_temperature"]
     H_high = fixed_data["humidity_threshold"]
-    P_overline = fixed_data["heating_max_power"]
+    P_max = fixed_data["heating_max_power"]
     T_circ = -3
     M_low = T_low - T_circ
     M_high = T_ok - T_circ
@@ -153,11 +84,10 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
 
     m = pyo.ConcreteModel()
     nids = [n.node_id for n in all_nodes]
-    terminal_ids = set(n.node_id for n in terminal_nodes)
     m.NODES = pyo.Set(initialize=nids)
 
-    m.p1 = pyo.Var(m.NODES, bounds=(0, P_overline))
-    m.p2 = pyo.Var(m.NODES, bounds=(0, P_overline))
+    m.p1 = pyo.Var(m.NODES, bounds=(0, P_max))
+    m.p2 = pyo.Var(m.NODES, bounds=(0, P_max))
     m.V = pyo.Var(m.NODES, within=pyo.Binary)
     m.temp1 = pyo.Var(m.NODES, bounds=(T_circ, 2 * T_high))
     m.temp2 = pyo.Var(m.NODES, bounds=(T_circ, 2 * T_high))
@@ -195,42 +125,29 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
 
     for node in all_nodes:
         nid = node.node_id
-        is_terminal = nid in terminal_ids
 
-        if not is_terminal:
-            # Decision-bearing node: same constraints + cost as SP non-leaf node.
+        if node.children:
             m.cons.add(m.temp1[nid] - T_high <= M_high * m.z1_hot[nid])
-            m.cons.add(m.p1[nid] <= P_overline * (1 - m.z1_hot[nid]))
+            m.cons.add(m.p1[nid] <= P_max * (1 - m.z1_hot[nid]))
             m.cons.add(m.temp2[nid] - T_high <= M_high * m.z2_hot[nid])
-            m.cons.add(m.p2[nid] <= P_overline * (1 - m.z2_hot[nid]))
+            m.cons.add(m.p2[nid] <= P_max * (1 - m.z2_hot[nid]))
 
             m.cons.add(T_low - m.temp1[nid] <= M_low * m.z1_cold[nid])
-            m.cons.add(m.p1[nid] >= P_overline * m.z1_cold[nid])
+            m.cons.add(m.p1[nid] >= P_max * m.z1_cold[nid])
             m.cons.add(T_low - m.temp2[nid] <= M_low * m.z2_cold[nid])
-            m.cons.add(m.p2[nid] >= P_overline * m.z2_cold[nid])
+            m.cons.add(m.p2[nid] >= P_max * m.z2_cold[nid])
 
             m.cons.add(m.hum[nid] - H_high <= M_hum * m.V[nid])
             price = node.state["current_price"]
             wp = _path_prob(node)
             obj_expr += wp * price * (m.p1[nid] + m.p2[nid] + p_vent * m.V[nid])
             m.cons.add(m.ON[nid] + m.OFF[nid] <= 1)
-        else:
-            # Terminal node: no decisions, but the state vars still exist so
-            # we can enforce dynamics from its parent. Pin decisions to zero
-            # to keep the search space clean.
-            m.p1[nid].fix(0)
-            m.p2[nid].fix(0)
-            m.V[nid].fix(0)
-            m.ON[nid].fix(0)
-            m.OFF[nid].fix(0)
-            m.z1_hot[nid].fix(0)
-            m.z2_hot[nid].fix(0)
 
         if node.parent is not None:
             parent = node.parent
             pid = parent.node_id
             parent_time = current_time + parent.stage
-            T_out_val = T_out[min(parent_time, len(T_out) - 1)]
+            T_out_val = T_out[parent_time]
 
             m.cons.add(
                 m.temp1[nid] == m.temp1[pid]
@@ -267,6 +184,26 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
             m.cons.add(T_ok - m.temp1[nid] <= M_high * (1 - m.z1_cold[pid] + m.z1_cold[nid]))
             m.cons.add(T_ok - m.temp2[nid] <= M_high * (1 - m.z2_cold[pid] + m.z2_cold[nid]))
 
+    # ----- CFA penalty terms at leaves (threshold form) -----
+    # Penalize only states close to triggering an override:
+    #   cold: max(0, T_LOW_PEN - T_leaf)      (override at T < 18)
+    #   humid: max(0, H_leaf - H_HIGH_PEN)    (override at H > 70)
+    leaf_ids = [leaf.node_id for leaf in leaves]
+    m.LEAVES = pyo.Set(initialize=leaf_ids)
+    m.slack_cold_r1 = pyo.Var(m.LEAVES, within=pyo.NonNegativeReals)
+    m.slack_cold_r2 = pyo.Var(m.LEAVES, within=pyo.NonNegativeReals)
+    m.slack_humid = pyo.Var(m.LEAVES, within=pyo.NonNegativeReals)
+
+    for leaf in leaves:
+        nid = leaf.node_id
+        m.cons.add(m.slack_cold_r1[nid] >= t_low_pen - m.temp1[nid])
+        m.cons.add(m.slack_cold_r2[nid] >= t_low_pen - m.temp2[nid])
+        m.cons.add(m.slack_humid[nid] >= m.hum[nid] - h_high_pen)
+
+        wp = _path_prob(leaf)
+        obj_expr += wp * alpha * (m.slack_cold_r1[nid] + m.slack_cold_r2[nid])
+        obj_expr += wp * beta * m.slack_humid[nid]
+
     m.objective = pyo.Objective(expr=obj_expr, sense=pyo.minimize)
     solver = pyo.SolverFactory("gurobi")
     solver.options["TimeLimit"] = 10
@@ -276,12 +213,11 @@ def _build_and_solve(state, root, all_nodes, terminal_nodes):
     return m, result
 
 
-def select_action(state):
+def select_action(state, alpha=None, beta=None, t_low_pen=None, h_high_pen=None):
     current_time = state["current_time"]
     remaining = NUM_SLOTS - current_time
     num_stages = max(1, min(NUM_STAGES, remaining))
 
-    # SP front-end
     root, all_nodes, leaves = build_scenario_tree(BF, num_stages)
     root.state = {
         "current_r1_occ": state["Occ1"],
@@ -291,12 +227,8 @@ def select_action(state):
     }
     propagate_uncertainty(root, all_nodes, num_samples=150)
 
-    # Deterministic MPC tail per leaf
-    all_nodes, _, terminal_nodes = _extend_with_deterministic_tail(
-        all_nodes, leaves, current_time
-    )
-
-    m, result = _build_and_solve(state, root, all_nodes, terminal_nodes)
+    m, result = _build_and_solve(state, root, all_nodes, leaves,
+                                  alpha, beta, t_low_pen, h_high_pen)
 
     rid = root.node_id
     ok = (result.solver.status == pyo.SolverStatus.ok and
